@@ -1,13 +1,13 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex}
-use std::thread;
+use std::sync::{Arc, Mutex, mpsc}
+use std::thread{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 // TODO - calling magical things atm, but mimicking the python code
 use crate::{
-    Sequence, SamplingParams, SequenceStatus,
-    scheduler::{Scheduler, SchedulerConfig, ScheduleResult},
-    model_runner::{ModelRunner, ModelRunnerConfig, ModelRunnerResult},
+    Sequence, SamplingParams, SequenceStatus, SequenceError,
+    scheduler::{Scheduler, SchedulerConfig, ScheduleResult, SchedulerError},
+    model_runner::{ModelRunner, ModelRunnerConfig, ModelRunnerResult, ModelRunnerError},
 }
 
 //config for LLM Engine
@@ -16,7 +16,7 @@ use crate::{
 pub struct LLMEngineConfig {
     pub model_path: String,
     pub tensor_parallel_size: usize,
-    pub max_num_steps: usize,
+    pub max_num_seqs: usize,
     pub max_num_batched_tokens: usize,
     pub max_model_len: usize,
     pub block_size: i32,
@@ -24,6 +24,8 @@ pub struct LLMEngineConfig {
     pub enforce_eager: bool,
     pub eos_token_id: Option<u32>, // 64?
     pub device_ids: Vec<i32>,
+    pub max_chunked_prefill_size: usize,
+    pub worker_timeout: Duration,
 }
 
 impl Default for LLMEngineConfig {
@@ -39,99 +41,66 @@ impl Default for LLMEngineConfig {
             enforce_eager: false,
             eos_token_id: None,
             device_ids: vec![0],
+            enable_chunked_prefill: true,
+            max_chunked_prefill_size: 4096,
+            worker_timeout: Duration::from_secs(30),
         }
     }
 }
 
-// Error types for LLM Engine
-#[derive(Debug)]
+//update error tpes
+#[derive(Debug, thiserror::Error)]
 pub enum LLMEngineError {
+    #[error("Initialization error: {0}")]
     InitializationError(String),
-    TokenizeError(String),
-    SchedulerError(String),
-    ModelRunnerError(String),
-    GenerationError(String),
+
+    #[error("Tokenize error: {0}")]
+    Tokenizer(String),
+
+    #[error("Scheduler error: {source}")]
+    Scheduler {
+        #[from]
+        source: SchedulerError,
+    },
+
+    #[error("Model runner error: {source}")]
+    ModelRunner {
+        #[from]
+        source: ModelRunnerError,
+    },
+
+    #[error("Generation error: {0}")]
+    Generation(String),
+
+    #[error("Sequence error: {source}")]
+    Sequence {
+        #[from]
+        source: SequenceError,
+    },
+
+    #[error("Worker thread error: {0}",) ]
+    Worker(String),
+
+    #[error("Timeout error: {0}")]
+    Timeout(String),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
 }
 
-impl std::fmt::Display for LLMEngineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LLMEngineError::InitializationError(msg) => write!(f, "LLMEngineError: {}", msg),
-            LLMEngineError::TokenizeError(msg) => write!(f, "LLMEngineError: {}", msg),
-            LLMEngineError::SchedulerError(msg) => write!(f, "LLMEngineError: {}", msg),
-            LLMEngineError::ModelRunnerError(msg) => write!(f, "LLMEngineError: {}", msg),
-            LLMEngineError::GenerationError(msg) => write!(f, "LLMEngineError: {}", msg),
-        }
-    }
-}
 
-impl std::error::Error for LLMEngineError {}
-
-impl From<crate::scheeduler::SchedulerError> for LLMEngineError {
-    fn from (err: crate::scheeduler::SchedulerError) -> Self {
-        LLMEngineError::SchedulerError(err.to_string())
-    }
-}
-
-impl From<crate::model_runner::ModelRunnerError> for LLMEngineError {
-    fn from (err: crate::model_runner::ModelRunnerError) -> Self {
-        LLMEngineError::ModelRunnerError(err.to_string())
-    }
-}
 
 pub type LLMEngineResult<T> = Result<T, LLMEngineError>;
 
 // Mock Tokenizer for now
-pub struct Tokenizer {
-    vocab_size: usize,
-    eos_token_id: u32,
-    vocab: HashMap<String, u32>,,
-    inverse_vocab: HashMap<u32, String>,
+pub trait Tokenizer: Send + Sync {
+    fn encode(&self, text: &str) -> Result<Vec<u32>, LLMEngineError>;
+    fn decode(&self, token_ids: &[u32]) -> Result<String, LLMEngineError>;
+    fn eos_token_id(&self) -> u32;
+    fn vocab_size(&self) -> usize;
 }
 
-impl Tokenizer {
-    pub fn new(vocab_size: usize, eos_token_id: u32) -> Self {
-        let mut vocab = HashMap::new();
-        let mut inverse_vocab = HashMap::new();
 
-        //simple vocab
-        for i in 0..vocab_size {
-            let token = format!("token_{}", i);
-            vocab.insert(token.clone9(), i as u32);
-            inverse_vocab.insert(i as u32, token);
-        }
-       //special tokens
-       vocab.insert("<eos>".to_string(), eos_token_id);
-       inverse_vocab.insert(eos_token_id, "<eos>".to_string());
-
-        Self {
-            vocab_size,
-            eos_token_id,
-            vocab,
-            inverse_vocab,
-        }
-
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        //word based for now
-        text.split_whitespace()
-            .map(|token| *self.vocab.get(token).unwrap_or(&0))
-            .collect()
-    }
-
-    pub fn decode(&self, token_ids: &[u32]) -> String {
-        token_ids.iter()
-            .filter_map(|&id| self.inverse_vocab.get(&id))
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    pub fn eos_token_id(&self) -> u32 {
-        self.eos_token_id
-    }
-}
-
-}
 
 // Generation stats
 #[derive(Debug, Clone, Default)]
@@ -141,7 +110,40 @@ pub struct GenerationStats {
     pub total_tokens_generated: usize,
     pub total_time: Duration,
     pub sequencess_completed: usize,
+    pub sequences_failed: usize,
+    pub average_latency: Duration,
+    pub peak_memory_usage: usize,
+    pub cache_hit_rate: f32,
 }
+
+impl GenerationStats {
+    pub fn update_throughput(&mut self, tokens: usize, duration: Duration, is_prefill: bool) {
+        let throughput = tokens as f32 / duration.as_secs_f32();
+        if is_prefill {
+            self.prefill_throughput = throughput;
+        } else {
+            self.decode_throughput = throughput;
+        }
+    }
+
+    pub fn complete_sequence(&mut self, tokens_generated: usize, latency: Duration) {
+        self.sequences_completed += 1;
+        self.total_tokens_generated += tokens_generated;
+        self.average_latency = if self.sequences_completed == 1 {
+            latency
+        } else {
+            Duration::from_nanos(
+                (self.average_latency.as_nanos() as u64 + latency.as_nanos() as u64) / 2
+            )
+        };
+    }
+
+    pub fn fail_sequence(&mut self) {
+        self.sequences_failed += 1;
+    }
+}
+
+
 
 
 // output of LLM Engine Generation Reequest
